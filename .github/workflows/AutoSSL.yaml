@@ -1,0 +1,238 @@
+name: Auto SSL
+
+on:
+  schedule:
+    - cron: "0 17 * * 1"
+  watch:
+    types: [started]
+
+env:
+    ACME: /home/runner/.acme.sh/acme.sh
+    EMAIL: ${{ secrets.ACCOUNT_EMAIL }}
+    DNSAPI: ${{ secrets.DNSAPI }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event.repository.owner.id == github.event.sender.id # 除了定时和repo owner手动触发的事件外， 其他不执行
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure Git
+      run: |
+        git config --global user.email $EMAIL
+        git config --global user.name acme
+
+    - name: Install Tree
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y tree
+
+    - name: Install yq
+      run: |
+        wget -O yq_linux_amd64 https://github.com/mikefarah/yq/releases/download/v4.28.1/yq_linux_amd64
+        chmod +x yq_linux_amd64
+        sudo mv yq_linux_amd64 /usr/local/bin/yq
+
+    - name: Install & Configure acme.sh
+      run: |
+        curl  https://get.acme.sh | sh -s email=$EMAIL
+        echo "$DNSAPI" >> /home/runner/.acme.sh/account.conf
+
+    # 更新证书检查报告
+    - name: Update Certificate.md
+      run: |
+        CURRENT_TIME=$(date +"%Y-%m-%d %H:%M:%S")
+
+        echo "## Certificate Status (Updated at $CURRENT_TIME)" > Certificate.md
+        echo "| Domain | Expiry Date (EC) | Issuer O (EC) | Issuer CN (EC) | Expiry Date (RSA) | Issuer O (RSA) | Issuer CN (RSA) |" >> Certificate.md
+        echo "|--------|------------------|---------------|----------------|-------------------|----------------|-----------------|" >> Certificate.md
+        
+        for domain_dir in ./ssl/*/; do
+          domain=$(basename "$domain_dir")
+          if [ -f "$domain_dir/$domain.cer" ]; then
+            expiry_date_ec=$(openssl x509 -enddate -noout -in "$domain_dir/$domain.cer" | cut -d= -f2)
+            issuer_info=$(openssl x509 -issuer -noout -in "$domain_dir/$domain.cer")
+            issuer_o_ec=$(echo "$issuer_info" | grep -oP 'O = \K[^,]*')
+            issuer_cn_ec=$(echo "$issuer_info" | grep -oP 'CN = \K.*')
+          else
+            expiry_date_ec="N/A"
+            issuer_o_ec="N/A"
+            issuer_cn_ec="N/A"
+          fi
+
+          if [ -f "$domain_dir/rsa/$domain.cer" ]; then
+            expiry_date_rsa=$(openssl x509 -enddate -noout -in "$domain_dir/rsa/$domain.cer" | cut -d= -f2)
+            issuer_o_rsa=$(echo "$issuer_info" | grep -oP 'O = \K[^,]*')
+            issuer_cn_rsa=$(echo "$issuer_info" | grep -oP 'CN = \K.*')
+          else
+            expiry_date_rsa="N/A"
+            issuer_o_rsa="N/A"
+            issuer_cn_rsa="N/A"
+          fi
+          echo "| $domain | $expiry_date_ec | $issuer_o_ec | $issuer_cn_ec | $expiry_date_rsa | $issuer_o_rsa | $issuer_cn_rsa |" >> Certificate.md
+        done
+
+        git add Certificate.md
+        git commit -m "Update Certificate.md with certificate expiry dates and execution time at $CURRENT_TIME"
+
+    # 签发和安装证书
+    - name: Issue & Deploy Certificates
+      run: |
+        # Function to create an issue on GitHub
+        create_github_issue() {
+          title=$1
+          body=$2
+          repo=${GITHUB_REPOSITORY}
+
+          curl -X POST -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+               -H "Accept: application/vnd.github+json" \
+               -H "X-GitHub-Api-Version: 2022-11-28" \
+               -d "{\"title\": \"$title\", \"body\": \"$body\"}" \
+               https://api.github.com/repos/$repo/issues
+        }
+
+        mkdir -p ./ssl
+
+        # Define the mapping of DNS providers to acme.sh plugins
+        declare -A dns_plugins=(
+          ["dnspod"]="dns_dp"
+          ["aliyun"]="dns_ali"
+          ["tencent"]="dns_tencent"
+          ["cloudflare"]="dns_cf"
+          ["aws"]="dns_aws"
+          # Add other DNS providers and their corresponding acme.sh plugins here
+          # 在此处添加其他DNS提供商及其相应的acme.sh插件
+          ["gadaddy"]="dns_gd"
+        )
+
+        # 使用 OpenSSL 检查证书是否在接下来 30 天内有效  
+        check_certificate_validity() {
+          cert_path=$1
+          if [ -f "$cert_path" ]; then
+            if openssl x509 -checkend $(( 30 * 86400 )) -noout -in "$cert_path"; then
+              echo "[-] Certificate at $cert_path is valid for more than 30 days, skipping..."
+              return 0
+            else
+              return 1
+            fi
+          else
+            return 1
+          fi
+        }
+
+        # 如果想要其他证书发行机构，可以把 acme.sh 的ca目录拷贝到 repo 的 ca目录
+        # 其他 CA 请参考 https://github.com/acmesh-official/acme.sh/wiki/CA
+        # mkdir -p /home/runner/.acme.sh/ca/
+        # cp -r ca/* /home/runner/.acme.sh/ca/
+
+        # 申请和安装证书
+        issue_and_install_certificate() {
+          domain=$1                         # 申请域名
+          cert_type=$2                      # 证书类型："EC" or "RSA"
+          acme_server=$3                    # ACME 服务器：default choose "letsencrypt"
+          keylength=$4                      # 密钥长度：empty for EC, "3072" for RSA
+          dns_plugin=${dns_plugins[$5]}     # DNS 服务商：dns_dp for dnspod, dns_ali for aliyun, dns_cf for cloudflare
+
+          cert_path="./ssl/$domain"         # 证书保存路径
+          [ "$cert_type" = "RSA" ] && cert_path="$cert_path/rsa"
+
+          cert_file="$cert_path/$domain.cer"
+          key_file="$cert_path/$domain.key"
+          
+          # 签发证书
+          echo "[+] Issue certificate..."
+          issue_status=0
+          $ACME --issue --server $acme_server --debug --dns $dns_plugin -d "$domain" -d "*.$domain" ${keylength:+--keylength $keylength}|| issue_status=$?
+          if [ $issue_status -ne 0 ]; then
+            echo "[-] Failed to issue $cert_type certificate for $domain, skipping..."
+            return
+          fi
+
+          # 安装证书
+          echo "[+] Install certificate..."
+          install_status=0
+          $ACME --installcert -d "$domain" --key-file "$key_file" --fullchain-file "$cert_file" || install_status=$?
+          if [ $install_status -ne 0 ]; then
+            echo "[-] Failed to install $cert_type certificate for $domain, skipping..."
+            return
+          fi
+
+          dir_path="./ssl/$domain"
+
+          # 检查目录是否存在
+          if [ -d "$dir_path" ]; then
+            # 使用find命令查找目录下的所有文件
+            # 如果find命令返回空，表示目录为空
+            # -mindepth 1 参数确保 find 命令不会错误地将空目录本身作为文件
+            if find "$dir_path" -mindepth 1 -type f > /dev/null; then
+              echo "[+] Directory '$dir_path' is not empty. Creating zip file..."
+              # 目录不为空，压缩目录及其子目录
+              zip -r "./ssl/$domain.zip" "$dir_path"
+            else
+              echo "[-] Directory '$dir_path' is empty. Skipping zip file creation."
+            fi
+          else
+            echo "[-] Directory '$dir_path' does not exist."
+          fi
+
+          TIMESTAMP=$(date +"%Y-%m-%d %H:%M:%S")
+          git add $cert_path/
+          git status
+          git commit -m "Update $cert_type certificate files for $domain at $TIMESTAMP"
+        }
+
+        # Read the YAML file for domains
+        while IFS= read -r provider; do
+          # Remove leading '-' from provider
+          provider=${provider#- }
+          
+          while IFS= read -r domain; do
+            # Remove leading '-' from domain
+            domain=${domain#- }
+            mkdir -p "./ssl/$domain/rsa"
+
+            echo "[+] DNS provider: $provider, Domain: $domain"
+            
+            # Check and issue/install EC certificate
+            if ! check_certificate_validity "./ssl/$domain/$domain.cer"; then
+              if [[ -n "${dns_plugins[$provider]}" ]]; then
+                issue_and_install_certificate "$domain" "EC" "letsencrypt" "" "$provider"
+              else
+                echo "[-] No DNS plugin configured for provider '$provider', skipping..."
+                # Create an issue if the provider is not configured
+                issue_title="$TIMESTAMP Missing DNS plugin configuration for $provider"
+                issue_body="The script skipped updating the certificate for $domain because there is no DNS plugin configured for the $provider provider."
+                create_github_issue "$issue_title" "$issue_body"
+              fi
+            fi
+        
+            # Check and issue/install RSA certificate
+            if ! check_certificate_validity "./ssl/$domain/rsa/$domain.cer"; then
+              if [[ -n "${dns_plugins[$provider]}" ]]; then
+                issue_and_install_certificate "$domain" "RSA" "letsencrypt" "3072" "$provider"
+              else
+                echo "[-] No DNS plugin configured for provider '$provider', skipping..."
+                # Create an issue if the provider is not configured
+                issue_title="$TIMESTAMP Missing DNS plugin configuration for $provider"
+                issue_body="The script skipped updating the RSA certificate for $domain because there is no DNS plugin configured for the $provider provider."
+                create_github_issue "$issue_title" "$issue_body"
+              fi
+            fi
+          done < <(yq eval ".[\"$provider\"]" domains.yaml)
+        done < <(yq eval 'keys' domains.yaml)
+
+        tree -a ssl
+        
+    - name: Commit
+      run: |
+        git add ./ssl/
+        git status
+        git commit -m "Update certificate files" -a
+
+    - name: Push changes
+      uses: ad-m/github-push-action@master
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}

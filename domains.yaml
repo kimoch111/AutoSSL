@@ -1,0 +1,13 @@
+dnspod:
+  - example.com
+tencent:
+  - example0.com
+aliyun:
+  - example1.com
+  - example2.com
+cloudflare:
+  - example3.com
+  - example4.com
+aws:
+  - example5.com
+  - example6.com
